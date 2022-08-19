@@ -1,3 +1,16 @@
+# Stanford Shapenet Renderer With Camera Poses & Synthetic blur
+This is extended work from [stanford-shapenet-renderer](https://github.com/panmari/stanford-shapenet-renderer)
+to create corresponding camera position matrix file.
+
+# 1) get Camera pose 
+If you run blender commend, it will create camera.txt file. Then, run txt2npz.py with the txt file to get npz file format.
+
+# 2) Synthetic blur
+If you run blender commend with --blend True flag, it will create preturbed images which are randomly slightly shifted.
+with these images, run blending.py to get synthetically blured images.
+To get corresponding unblurred images & camera position, just run blender commend agian without --blend True flag.
+
+# Original Readme....
 # Stanford Shapenet Renderer
 
 A little helper script to render .obj files (such as from the stanford shapenet database) with Blender.
