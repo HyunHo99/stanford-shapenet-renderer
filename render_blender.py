@@ -10,13 +10,130 @@
 import argparse, sys, os, math, re
 import bpy
 from glob import glob
+import os
+import random
+# import numpy as np
+import bpy_extras
+from mathutils import Matrix
+from mathutils import Vector
+
+#---------------------------------------------------------------
+# 3x4 P matrix from Blender camera
+#---------------------------------------------------------------
+
+# BKE_camera_sensor_size
+def get_sensor_size(sensor_fit, sensor_x, sensor_y):
+    if sensor_fit == 'VERTICAL':
+        return sensor_y
+    return sensor_x
+
+# BKE_camera_sensor_fit
+def get_sensor_fit(sensor_fit, size_x, size_y):
+    if sensor_fit == 'AUTO':
+        if size_x >= size_y:
+            return 'HORIZONTAL'
+        else:
+            return 'VERTICAL'
+    return sensor_fit
+
+# Build intrinsic camera parameters from Blender camera data
+#
+# See notes on this in 
+# blender.stackexchange.com/questions/15102/what-is-blenders-camera-projection-matrix-model
+# as well as
+# https://blender.stackexchange.com/a/120063/3581
+def get_calibration_matrix_K_from_blender(camd):
+    if camd.type != 'PERSP':
+        raise ValueError('Non-perspective cameras not supported')
+    scene = bpy.context.scene
+    f_in_mm = camd.lens
+    scale = scene.render.resolution_percentage / 100
+    resolution_x_in_px = scale * scene.render.resolution_x
+    resolution_y_in_px = scale * scene.render.resolution_y
+    sensor_size_in_mm = get_sensor_size(camd.sensor_fit, camd.sensor_width, camd.sensor_height)
+    sensor_fit = get_sensor_fit(
+        camd.sensor_fit,
+        scene.render.pixel_aspect_x * resolution_x_in_px,
+        scene.render.pixel_aspect_y * resolution_y_in_px
+    )
+    pixel_aspect_ratio = scene.render.pixel_aspect_y / scene.render.pixel_aspect_x
+    if sensor_fit == 'HORIZONTAL':
+        view_fac_in_px = resolution_x_in_px
+    else:
+        view_fac_in_px = pixel_aspect_ratio * resolution_y_in_px
+    pixel_size_mm_per_px = sensor_size_in_mm / f_in_mm / view_fac_in_px
+    s_u = 1 / pixel_size_mm_per_px
+    s_v = 1 / pixel_size_mm_per_px / pixel_aspect_ratio
+
+    # Parameters of intrinsic calibration matrix K
+    u_0 = resolution_x_in_px / 2 - camd.shift_x * view_fac_in_px
+    v_0 = resolution_y_in_px / 2 + camd.shift_y * view_fac_in_px / pixel_aspect_ratio
+    skew = 0 # only use rectangular pixels
+
+    K = Matrix(
+        ((s_u, skew, u_0),
+        (   0,  s_v, v_0),
+        (   0,    0,   1)))
+    return K
+
+# Returns camera rotation and translation matrices from Blender.
+# 
+# There are 3 coordinate systems involved:
+#    1. The World coordinates: "world"
+#       - right-handed
+#    2. The Blender camera coordinates: "bcam"
+#       - x is horizontal
+#       - y is up
+#       - right-handed: negative z look-at direction
+#    3. The desired computer vision camera coordinates: "cv"
+#       - x is horizontal
+#       - y is down (to align to the actual pixel coordinates 
+#         used in digital images)
+#       - right-handed: positive z look-at direction
+def get_3x4_RT_matrix_from_blender(cam):
+    # bcam stands for blender camera
+    R_bcam2cv = Matrix(
+        ((1, 0,  0),
+        (0, -1, 0),
+        (0, 0, -1)))
+
+    # Transpose since the rotation is object rotation, 
+    # and we want coordinate rotation
+    # R_world2bcam = cam.rotation_euler.to_matrix().transposed()
+    # T_world2bcam = -1*R_world2bcam @ location
+    #
+    # Use matrix_world instead to account for all constraints
+    location, rotation = cam.matrix_world.decompose()[0:2]
+    R_world2bcam = rotation.to_matrix().transposed()
+
+    # Convert camera location to translation vector used in coordinate changes
+    # T_world2bcam = -1*R_world2bcam @ cam.location
+    # Use location from matrix_world to account for constraints:     
+    T_world2bcam = -1*R_world2bcam @ location
+
+    # Build the coordinate transform matrix from world to computer vision camera
+    R_world2cv = R_bcam2cv@R_world2bcam
+    T_world2cv = R_bcam2cv@T_world2bcam
+
+    # put into 3x4 matrix
+    RT = Matrix((
+        R_world2cv[0][:] + (T_world2cv[0],),
+        R_world2cv[1][:] + (T_world2cv[1],),
+        R_world2cv[2][:] + (T_world2cv[2],)
+        ))
+    return RT
+
+def get_3x4_P_matrix_from_blender(cam):
+    K = get_calibration_matrix_K_from_blender(cam.data)
+    RT = get_3x4_RT_matrix_from_blender(cam)
+    return K@RT, K, RT
 
 parser = argparse.ArgumentParser(description='Renders given obj file by rotation a camera around it.')
 parser.add_argument('--views', type=int, default=30,
                     help='number of views to be rendered')
 parser.add_argument('obj', type=str,
                     help='Path to the obj file to be rendered.')
-parser.add_argument('--output_folder', type=str, default='/tmp',
+parser.add_argument('--output_folder', type=str, default='./image',
                     help='The path the output will be dumped to.')
 parser.add_argument('--scale', type=float, default=1,
                     help='Scaling factor applied to model. Depends on size of mesh.')
@@ -32,11 +149,17 @@ parser.add_argument('--format', type=str, default='PNG',
                     help='Format of files generated. Either PNG or OPEN_EXR')
 parser.add_argument('--resolution', type=int, default=600,
                     help='Resolution of the images.')
-parser.add_argument('--engine', type=str, default='BLENDER_EEVEE',
+parser.add_argument('--engine', type=str, default='CYCLES',
                     help='Blender internal engine for rendering. E.g. CYCLES, BLENDER_EEVEE, ...')
+parser.add_argument('--gpu', type=int, default=0)
+parser.add_argument('--blend', type=bool, default=False)
+
 
 argv = sys.argv[sys.argv.index("--") + 1:]
 args = parser.parse_args(argv)
+
+
+
 
 # Set up rendering
 context = bpy.context
@@ -44,7 +167,7 @@ scene = bpy.context.scene
 render = bpy.context.scene.render
 
 render.engine = args.engine
-render.image_settings.color_mode = 'RGBA' # ('RGB', 'RGBA', ...)
+render.image_settings.color_mode = 'RGB' # ('RGB', 'RGBA', ...)
 render.image_settings.color_depth = args.color_depth # ('8', '16')
 render.image_settings.file_format = args.format # ('PNG', 'OPEN_EXR', 'JPEG, ...)
 render.resolution_x = args.resolution
@@ -57,6 +180,19 @@ scene.view_layers["View Layer"].use_pass_normal = True
 scene.view_layers["View Layer"].use_pass_diffuse_color = True
 scene.view_layers["View Layer"].use_pass_object_index = True
 
+# Set the device_type
+bpy.context.preferences.addons[
+    "cycles"
+].preferences.compute_device_type = "CUDA" # or "OPENCL"
+
+# Set the device and feature set
+bpy.context.scene.cycles.device = "GPU"
+bpy.context.preferences.addons["cycles"].preferences.get_devices()
+for d in bpy.context.preferences.addons["cycles"].preferences.devices:
+    d["use"] = 0 # Using all devices, include GPU and CPU
+    print(d["name"], d["use"])
+bpy.context.preferences.addons["cycles"].preferences.devices[args.gpu]["use"]=1
+
 nodes = bpy.context.scene.node_tree.nodes
 links = bpy.context.scene.node_tree.links
 
@@ -68,27 +204,27 @@ for n in nodes:
 render_layers = nodes.new('CompositorNodeRLayers')
 
 # Create depth output nodes
-depth_file_output = nodes.new(type="CompositorNodeOutputFile")
-depth_file_output.label = 'Depth Output'
-depth_file_output.base_path = ''
-depth_file_output.file_slots[0].use_node_format = True
-depth_file_output.format.file_format = args.format
-depth_file_output.format.color_depth = args.color_depth
-if args.format == 'OPEN_EXR':
-    links.new(render_layers.outputs['Depth'], depth_file_output.inputs[0])
-else:
-    depth_file_output.format.color_mode = "BW"
+# depth_file_output = nodes.new(type="CompositorNodeOutputFile")
+# depth_file_output.label = 'Depth Output'
+# depth_file_output.base_path = ''
+# depth_file_output.file_slots[0].use_node_format = True
+# depth_file_output.format.file_format = args.format
+# depth_file_output.format.color_depth = args.color_depth
+# if args.format == 'OPEN_EXR':
+#     links.new(render_layers.outputs['Depth'], depth_file_output.inputs[0])
+# else:
+#     depth_file_output.format.color_mode = "BW"
 
-    # Remap as other types can not represent the full range of depth.
-    map = nodes.new(type="CompositorNodeMapValue")
-    # Size is chosen kind of arbitrarily, try out until you're satisfied with resulting depth map.
-    map.offset = [-0.7]
-    map.size = [args.depth_scale]
-    map.use_min = True
-    map.min = [0]
+#     # Remap as other types can not represent the full range of depth.
+#     map = nodes.new(type="CompositorNodeMapValue")
+#     # Size is chosen kind of arbitrarily, try out until you're satisfied with resulting depth map.
+#     map.offset = [-0.7]
+#     map.size = [args.depth_scale]
+#     map.use_min = True
+#     map.min = [0]
 
-    links.new(render_layers.outputs['Depth'], map.inputs[0])
-    links.new(map.outputs[0], depth_file_output.inputs[0])
+#     links.new(render_layers.outputs['Depth'], map.inputs[0])
+#     links.new(map.outputs[0], depth_file_output.inputs[0])
 
 # Create normal output nodes
 scale_node = nodes.new(type="CompositorNodeMixRGB")
@@ -103,12 +239,12 @@ bias_node.blend_type = 'ADD'
 bias_node.inputs[2].default_value = (0.5, 0.5, 0.5, 0)
 links.new(scale_node.outputs[0], bias_node.inputs[1])
 
-normal_file_output = nodes.new(type="CompositorNodeOutputFile")
-normal_file_output.label = 'Normal Output'
-normal_file_output.base_path = ''
-normal_file_output.file_slots[0].use_node_format = True
-normal_file_output.format.file_format = args.format
-links.new(bias_node.outputs[0], normal_file_output.inputs[0])
+# normal_file_output = nodes.new(type="CompositorNodeOutputFile")
+# normal_file_output.label = 'Normal Output'
+# normal_file_output.base_path = ''
+# normal_file_output.file_slots[0].use_node_format = True
+# normal_file_output.format.file_format = args.format
+# links.new(bias_node.outputs[0], normal_file_output.inputs[0])
 
 # Create albedo output nodes
 alpha_albedo = nodes.new(type="CompositorNodeSetAlpha")
@@ -125,25 +261,25 @@ albedo_file_output.format.color_depth = args.color_depth
 links.new(alpha_albedo.outputs['Image'], albedo_file_output.inputs[0])
 
 # Create id map output nodes
-id_file_output = nodes.new(type="CompositorNodeOutputFile")
-id_file_output.label = 'ID Output'
-id_file_output.base_path = ''
-id_file_output.file_slots[0].use_node_format = True
-id_file_output.format.file_format = args.format
-id_file_output.format.color_depth = args.color_depth
+# id_file_output = nodes.new(type="CompositorNodeOutputFile")
+# id_file_output.label = 'ID Output'
+# id_file_output.base_path = ''
+# id_file_output.file_slots[0].use_node_format = True
+# id_file_output.format.file_format = args.format
+# id_file_output.format.color_depth = args.color_depth
 
-if args.format == 'OPEN_EXR':
-    links.new(render_layers.outputs['IndexOB'], id_file_output.inputs[0])
-else:
-    id_file_output.format.color_mode = 'BW'
+# if args.format == 'OPEN_EXR':
+#     links.new(render_layers.outputs['IndexOB'], id_file_output.inputs[0])
+# else:
+#     id_file_output.format.color_mode = 'BW'
 
-    divide_node = nodes.new(type='CompositorNodeMath')
-    divide_node.operation = 'DIVIDE'
-    divide_node.use_clamp = False
-    divide_node.inputs[1].default_value = 2**int(args.color_depth)
+#     divide_node = nodes.new(type='CompositorNodeMath')
+#     divide_node.operation = 'DIVIDE'
+#     divide_node.use_clamp = False
+#     divide_node.inputs[1].default_value = 2**int(args.color_depth)
 
-    links.new(render_layers.outputs['IndexOB'], divide_node.inputs[0])
-    links.new(divide_node.outputs[0], id_file_output.inputs[0])
+#     links.new(render_layers.outputs['IndexOB'], divide_node.inputs[0])
+#     links.new(divide_node.outputs[0], id_file_output.inputs[0])
 
 # Delete default cube
 context.active_object.select_set(True)
@@ -215,23 +351,50 @@ cam_constraint.target = cam_empty
 stepsize = 360.0 / args.views
 rotation_mode = 'XYZ'
 
+if not os.path.exists(args.output_folder):
+    os.mkdir(args.output_folder)
+    
+txt=open(os.path.join(os.path.abspath(args.output_folder), "cameras.txt"),'w')
+
 model_identifier = os.path.split(os.path.split(args.obj)[0])[1]
-fp = os.path.join(os.path.abspath(args.output_folder), model_identifier, model_identifier)
+fp = os.path.join(os.path.abspath(args.output_folder))
+cameras={}
+locations = [(0, 1, 0.6), (0, 0.83, 0.83)]
+for k in range(len(locations)):
+    cam.location = locations[k]
+    cam_empty.rotation_euler[2] = 0.
+    for i in range(0, args.views):
+        print("Rotation {}, {}".format((stepsize * i), math.radians(stepsize * i)))
+        
+        if args.blend==False:
+            dxyz = [(random.random()*2 -1)* 1e-2 * 3 for _ in range(3)]
+            
+            render_file_path = fp + '/pert_{0:03d}_0'.format((i + args.views*k))
+            scene.render.filepath = render_file_path
+            cam.delta_location = dxyz
 
-for i in range(0, args.views):
-    print("Rotation {}, {}".format((stepsize * i), math.radians(stepsize * i)))
+            bpy.ops.render.render(write_still=True) 
+            
+            render_file_path = fp + '/pert_{0:03d}_1'.format((i + args.views*k))
+            dxyz = [-i for i in dxyz]
+            scene.render.filepath = render_file_path
+            cam.delta_location = dxyz
+            
+            bpy.ops.render.render(write_still=True) 
+            
+            cam.delta_location = (0,0,0)
+        else:
+            render_file_path = fp + '/pert_{0:03d}'.format((i + args.views*k))
+            scene.render.filepath = render_file_path
+            
+            bpy.ops.render.render(write_still=True) 
+        
+            P, K, RT = get_3x4_P_matrix_from_blender(cam)
+            txt.write('world_mat_%d' % (i + args.views*k) + '\n')
+            txt.write(str([list(i) for i in list(P)]) + '\n')
 
-    render_file_path = fp + '_r_{0:03d}'.format(int(i * stepsize))
-
-    scene.render.filepath = render_file_path
-    depth_file_output.file_slots[0].path = render_file_path + "_depth"
-    normal_file_output.file_slots[0].path = render_file_path + "_normal"
-    albedo_file_output.file_slots[0].path = render_file_path + "_albedo"
-    id_file_output.file_slots[0].path = render_file_path + "_id"
-
-    bpy.ops.render.render(write_still=True)  # render still
-
-    cam_empty.rotation_euler[2] += math.radians(stepsize)
-
+        cam_empty.rotation_euler[2] += math.radians(stepsize)
+    
+txt.close()
 # For debugging the workflow
 #bpy.ops.wm.save_as_mainfile(filepath='debug.blend')
